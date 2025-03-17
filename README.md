@@ -1,5 +1,5 @@
 # fast-aes-break
-Breaking 128-bit AES encryption using power traces within 1 second(~750ms). It
+Breaking 128-bit AES encryption using power traces within 1 second(~220ms). It
 uses 50 encryptions and their power traces with 5000 trace samples.
 
 # TODO
@@ -16,6 +16,13 @@ uses 50 encryptions and their power traces with 5000 trace samples.
   close to ~0.01% but that implementation involves a lot of write contention and
   is not getting along with the optimizer, so the overall time increases in it.
   (not worthit)
+- [x] Do some data clean up to discard useless samples.
+  
+  All the useful trace samples are clumped together. After finding the first
+  correct key guess only consider a fraction of the total samples availavle for 
+  further processing. The constant `SURROUND` is used to consider only `SURROUND/2`
+  samples around it. Received key may not be correct if this range is too small,
+  a runtime error will occur if that happens.
 - [ ] Remove hardcoded dependencies on number of threads and key sizes.
 
   Currently the thread count must be 8 and key size must be 16.

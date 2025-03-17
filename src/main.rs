@@ -3,6 +3,10 @@ use std::time;
 use std::thread;
 mod correlation;
 
+/// Consider `SURROUND / 2` samples before and after the center to be useful,
+/// discard rest.
+const SURROUND: usize = 1500;
+
 /// Number of threads. DO NOT CHANGE it.
 const THREADS: usize = 8;
 
@@ -64,7 +68,7 @@ fn main() -> hdf5::Result<()> {
     let key_original = key_array.index_axis(Axis(0), 0).iter()
         .map(|x| *x)
         .collect::<Vec<u8>>();
-    println!("original:\t{key_original:?}");
+    println!("original: {key_original:?}");
 
     // Filter the traces.
     // Create empty array of the same size as the corrected trace_array 2D
@@ -104,6 +108,41 @@ fn main() -> hdf5::Result<()> {
         input_columns.push(inner);
     }
 
+    // Find center of the trace samples. 
+    // All the samples are not equally useful. Once the encryption starts then
+    // all trace samples that give high correlation upon correct key_guess are
+    // clumped together. We just need to find the correct trace sample for the
+    // first key byte, then for further processing we should only consider trace
+    // samples around that.
+    let center = {
+        let mut max_coeff = 0.0;
+        let mut col_idx = 0;
+        for key_guess in 0..=255u8 {
+            let powers = (&input_columns[0]).into_iter().map(|i: &u8| {
+                let idx = key_guess ^ *i;
+                power_model(SBOX[idx as usize]) as f64
+            }).collect::<Vec<f64>>();
+
+            for (i, trace) in trace_columns.iter().enumerate() {
+                let coeff = correlation::pearson(&powers, trace).abs();
+                if coeff > max_coeff {
+                    max_coeff = coeff;
+                    col_idx = i;
+                }
+            }
+        }
+        col_idx
+    };
+    // println!("center: {}", center);
+
+    let first_trace = center.saturating_sub(SURROUND / 2);
+    let last_trace = if center + SURROUND / 2 > CORRECT_SAMPLES - 1 {
+        CORRECT_SAMPLES - 1
+    } else {
+        center + SURROUND / 2
+    };
+    let useful_traces = &trace_columns[first_trace..last_trace];
+
     let begin = time::Instant::now();
 
     // Key will be stored here.
@@ -122,7 +161,7 @@ fn main() -> hdf5::Result<()> {
                 power_model(SBOX[idx as usize]) as f64
             }).collect::<Vec<f64>>();
 
-            for trace in &trace_columns {
+            for trace in useful_traces {
                 let coeff = correlation::pearson(&powers, trace).abs();
                 if coeff > max_coeff {
                     max_coeff = coeff;
@@ -130,7 +169,7 @@ fn main() -> hdf5::Result<()> {
                 }
             }
         }
-
+        // println!("trace sample index: {}, key_byte: {}", col_idx, idx_key);
         key_at_max
     };
 
@@ -146,7 +185,7 @@ fn main() -> hdf5::Result<()> {
     let _key_solver_cache = |idx_key: usize| {
         let mut max_coeff = 0.0;
         let mut key_at_max = 0;
-        for trace in &trace_columns {
+        for trace in useful_traces {
             let mut powers = vec![0.0; TRACE_COUNT];
 
             for key_guess in 0..=255 {
@@ -194,28 +233,35 @@ fn main() -> hdf5::Result<()> {
     
     let elapsed = begin.elapsed();
  
-    println!("recovered:\t{:?}", key);
-    println!("time: {elapsed:.03?}");
+    println!("recovered: {:?}", key);
 
-    assert_eq!(key_original, key, "recovered and original keys did not matched");
+    assert!(key_original.eq(&key), "Recovered and original keys did not matched. Try \
+        increasing the surrounding value. Currently SURROUND = {SURROUND}");
+
     println!("recovered and original keys matched.");
+    println!("time: {elapsed:.03?}");
 
     Ok(())
 }
 
 /// Hamming weights of each byte.
 const HAMMING_WEIGHTS: [usize; 256] = [
-    0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4,1,2,2,3,2,3,3,4,2,
-    3,3,4,3,4,4,5,1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,2,3,
-    3,4,3,4,4,5,3,4,4,5,4,5,5,6,1,2,2,3,2,3,3,4,2,3,3,
-    4,3,4,4,5,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,2,3,3,4,
-    3,4,4,5,3,4,4,5,4,5,5,6,3,4,4,5,4,5,5,6,4,5,5,6,5,
-    6,6,7,1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,2,3,3,4,3,4,
-    4,5,3,4,4,5,4,5,5,6,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,
-    6,3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,2,3,3,4,3,4,4,5,
-    3,4,4,5,4,5,5,6,3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,3,
-    4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,4,5,5,6,5,6,6,7,5,6,
-    6,7,6,7,7,8
+    0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4,
+    1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,
+    1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,
+    2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,
+    1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,
+    2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,
+    2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,
+    3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,
+    1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,
+    2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,
+    2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,
+    3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,
+    2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,
+    3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,
+    3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,
+    4,5,5,6,5,6,6,7,5,6,6,7,6,7,7,8,
 ];
 
 /// It maps a byte(output after sbox) to its hamming weight. The assumption 
