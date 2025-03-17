@@ -1,5 +1,10 @@
 use ndarray::{Dim, ArrayBase, OwnedRepr, Axis, ArrayView1};
 use std::time;
+use std::thread;
+mod correlation;
+
+/// Number of threads. DO NOT CHANGE it.
+const THREADS: usize = 8;
 
 /// HDF5 file path relative to crate root.
 const FILEPATH: &'static str = "./foobarbaz.h5";
@@ -7,7 +12,7 @@ const FILEPATH: &'static str = "./foobarbaz.h5";
 /// Size of message in bytes.
 const MESSAGE_SIZE: usize = 16;
 
-/// Size of key in bytes.
+/// Size of key in bytes. DO NOT CHANGE it.
 const KEY_SIZE: usize = 16;
 
 /// Number of traces available.
@@ -40,6 +45,7 @@ const SBOX: [u8; 256] = [
 ];
 
 fn main() -> hdf5::Result<()> {
+    // Open hdf5 file.
     let file = hdf5::File::open(FILEPATH)?;
 
     let trace_array_dataset = file.dataset("trace_array")?;
@@ -54,15 +60,16 @@ fn main() -> hdf5::Result<()> {
     let key_array = key_array_dataset.read::<u8, Dim<[usize; 2]>>().unwrap();
     assert_eq!(key_array.shape(), [TRACE_COUNT, KEY_SIZE]);
 
+    // Extract the original key. Assuming each row in key_array is same.
     let key_original = key_array.index_axis(Axis(0), 0).iter()
         .map(|x| *x)
         .collect::<Vec<u8>>();
     println!("original:\t{key_original:?}");
 
-    // Filter the traces
+    // Filter the traces.
     // Create empty array of the same size as the corrected trace_array 2D
     // array. Filter the trace_array and fill the elements in this array one
-    // trace at a time
+    // trace at a time.
     let mut trace_array_filtered: ndarray::ArrayBase<OwnedRepr<f64>, Dim<[usize; 2]>> =
         ArrayBase::zeros([TRACE_COUNT, CORRECT_SAMPLES]);
     for (row, trace) in trace_array.axis_iter(Axis(0)).enumerate() {
@@ -98,7 +105,15 @@ fn main() -> hdf5::Result<()> {
     }
 
     let begin = time::Instant::now();
-    let key = (0..16).map(|idx_key| {
+
+    // Key will be stored here.
+    let mut key = Vec::with_capacity(KEY_SIZE);
+
+    // cache preformance:
+    // > perf stat -e L1-dcache-loads,L1-dcache-load-misses ./target/release/fast-aes-break
+    // 6,435,821,080      L1-dcache-loads:u
+    //   138,010,582      L1-dcache-load-misses:u          #    2.14% of all L1-dcache accesses
+    let key_solver = |idx_key: usize| {
         let mut max_coeff = 0.0;
         let mut key_at_max = 0;
         for key_guess in 0..=255u8 {
@@ -108,7 +123,7 @@ fn main() -> hdf5::Result<()> {
             }).collect::<Vec<f64>>();
 
             for trace in &trace_columns {
-                let coeff = pearson(&powers, trace).abs();
+                let coeff = correlation::pearson(&powers, trace).abs();
                 if coeff > max_coeff {
                     max_coeff = coeff;
                     key_at_max = key_guess;
@@ -117,7 +132,66 @@ fn main() -> hdf5::Result<()> {
         }
 
         key_at_max
-    }).collect::<Vec<u8>>();
+    };
+
+    // Cache friendly version of key_solver.
+    // This one is cache friendly but it involves writes in the 'powers' vector
+    // which are difficult for the optimizer to deal with. The previous version
+    // did not fit entirely in L1 cache but there were no writes involved.
+    //
+    // cache performance:
+    // > perf stat -e L1-dcache-loads,L1-dcache-load-misses ./target/release/fast-aes-break
+    // 15,716,511,519      L1-dcache-loads:u
+    //        687,935      L1-dcache-load-misses:u          #    0.00% of all L1-dcache accesses
+    let _key_solver_cache = |idx_key: usize| {
+        let mut max_coeff = 0.0;
+        let mut key_at_max = 0;
+        for trace in &trace_columns {
+            let mut powers = vec![0.0; TRACE_COUNT];
+
+            for key_guess in 0..=255 {
+                for (i, p) in powers.iter_mut().enumerate() {
+                    let xorred = &input_columns[idx_key][i] ^ key_guess;
+                    *p = power_model(SBOX[xorred as usize]) as f64;
+                }
+                let coeff = correlation::pearson(&powers, trace).abs();
+                if coeff > max_coeff {
+                    max_coeff = coeff;
+                    key_at_max = key_guess;
+                }
+            }
+        }
+
+        key_at_max
+    };
+
+
+    // Number of chunks in which processing will be done. Each chunk will
+    // be processed by THREADS number of threads at a time.
+    const CHUNKS: usize = if KEY_SIZE % THREADS == 0 {
+        KEY_SIZE / THREADS
+    } else {
+        (KEY_SIZE / THREADS) + 1
+    };
+
+    for chunk in 0..CHUNKS {
+        let i = chunk * THREADS;
+        thread::scope(|s| {
+            let mut handles = Vec::with_capacity(THREADS);
+
+            handles.push(s.spawn(|| key_solver(i)));
+            handles.push(s.spawn(|| key_solver(i + 1)));
+            handles.push(s.spawn(|| key_solver(i + 2)));
+            handles.push(s.spawn(|| key_solver(i + 3)));
+            handles.push(s.spawn(|| key_solver(i + 4)));
+            handles.push(s.spawn(|| key_solver(i + 5)));
+            handles.push(s.spawn(|| key_solver(i + 6)));
+            handles.push(s.spawn(|| key_solver(i + 7)));
+
+            key.extend(handles.into_iter().map(|h| h.join().unwrap()));
+        });
+    }
+    
     let elapsed = begin.elapsed();
  
     println!("recovered:\t{:?}", key);
@@ -127,26 +201,6 @@ fn main() -> hdf5::Result<()> {
     println!("recovered and original keys matched.");
 
     Ok(())
-}
-
-/// Find pearsons coefficient between two slices of f64 which are of same sizes.
-fn pearson<T: AsRef<[f64]>>(x: &T, y: &T) -> f64 {
-    let x = AsRef::<[f64]>::as_ref(x);
-    let y = AsRef::<[f64]>::as_ref(y);
-    let n = x.len();
-    assert_eq!(n, y.len());
-    let n = n as f64;
-
-    let x_sum: f64 = x.iter().sum();
-    let y_sum: f64 = y.iter().sum();
-
-    let x_sq_sum: f64 = x.iter().map(|_x| _x * _x).sum();
-    let y_sq_sum: f64 = y.iter().map(|_y| _y * _y).sum();
-
-    let prod_sum: f64 = x.iter().zip(y.iter()).map(|(_x, _y)| _x * _y).sum();
-
-    (n * prod_sum - x_sum * y_sum) / 
-        f64::sqrt((n * x_sq_sum - x_sum * x_sum) * (n * y_sq_sum - y_sum * y_sum))
 }
 
 /// Hamming weights of each byte.

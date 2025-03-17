@@ -1,10 +1,24 @@
 # fast-aes-break
-Breaking AES encryption using power traces in sub millisecond time.
+Breaking 128-bit AES encryption using power traces within 1 second(~750ms). It
+uses 50 encryptions and their power traces with 5000 trace samples.
 
 # TODO
-- [ ] Add multithreading, make sure threads are not hyperthread syblings
-- [ ] Use SIMD for pearson correlation calculation
-- [ ] Experiment to get better cache locality
+- [x] Add multithreading
+
+  It uses 8 threads. It will be better if they are not sybling threads in
+  hyperthreaded environment, but its fine if they are.
+- [x] Experiment with SIMD for pearson correlation calculation.
+
+  SIMD overhead is shadowing its benefits in small arrays of size ~50.
+- [x] Experiment to get better cache locality.
+
+  Current implementation has ~2.13% L1-d cache misses, it is possible to get it
+  close to ~0.01% but that implementation involves a lot of write contention and
+  is not getting along with the optimizer, so the overall time increases in it.
+  (not worthit)
+- [ ] Remove hardcoded dependencies on number of threads and key sizes.
+
+  Currently the thread count must be 8 and key size must be 16.
 
 # Prerequisities
 - Any Unix like operating system
@@ -26,3 +40,7 @@ create the aggressively optimized version.
 ## Runing
 `cargo run` to run the debug version or `cargo run --release` to run the
 release version.
+
+## Docs
+To create documents(if any) run the following command: `cargo doc --no-deps`.
+This will open some documentations in your default browser.
