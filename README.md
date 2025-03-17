@@ -22,16 +22,21 @@ uses 50 encryptions and their power traces with 5000 trace samples.
 
 # Prerequisities
 - Any Unix like operating system
-- Stable Rust toolchain, see below
+- Stable Rust toolchain and `cmake`, see below
 - Power trace file in HDF5 format. Rename it to `foobarbaz.h5`, or use the
   default file provided in this repo.
 
 ## To Get Stable Rust Toolchain
 run `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`, then
-choose to proceed with standard installation.
+choose to proceed with standard installation. It should take less than 3-4min 
+to install with fast internet connection.
 
-To test if everything was installed correctly, run the following commands:
-`cargo --version`, `rustc --version`
+To test if everything was installed correctly, restart your terminal and run the
+following commands: `cargo --version`, `rustc --version`, they should succeed.
+
+Later if you want to uninstall rust run `rustup self uninstall`.
+
+Also make sure that you have `cmake` installed.
 
 ## Building
 Run `cargo build` to create the debug build, or `cargo build --release` to
