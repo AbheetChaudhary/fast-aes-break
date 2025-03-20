@@ -124,7 +124,7 @@ fn main() -> hdf5::Result<()> {
             }).collect::<Vec<f64>>();
 
             for (i, trace) in trace_columns.iter().enumerate() {
-                let coeff = correlation::pearson(&powers, trace).abs();
+                let coeff = correlation::pearson_simd(&powers, trace).abs();
                 if coeff > max_coeff {
                     max_coeff = coeff;
                     col_idx = i;
@@ -162,7 +162,7 @@ fn main() -> hdf5::Result<()> {
             }).collect::<Vec<f64>>();
 
             for trace in useful_traces {
-                let coeff = correlation::pearson(&powers, trace).abs();
+                let coeff = correlation::pearson_simd(&powers, trace).abs();
                 if coeff > max_coeff {
                     max_coeff = coeff;
                     key_at_max = key_guess;
@@ -193,7 +193,7 @@ fn main() -> hdf5::Result<()> {
                     let xorred = &input_columns[idx_key][i] ^ key_guess;
                     *p = power_model(SBOX[xorred as usize]) as f64;
                 }
-                let coeff = correlation::pearson(&powers, trace).abs();
+                let coeff = correlation::pearson_simd(&powers, trace).abs();
                 if coeff > max_coeff {
                     max_coeff = coeff;
                     key_at_max = key_guess;

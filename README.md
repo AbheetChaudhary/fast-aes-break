@@ -1,5 +1,5 @@
 # fast-aes-break
-Breaking 128-bit AES encryption using power traces within 1 second(~220ms). It
+Breaking 128-bit AES encryption using power traces within 1 second(~80ms). It
 uses 50 encryptions and their power traces with 5000 trace samples.
 
 # TODO
@@ -9,7 +9,8 @@ uses 50 encryptions and their power traces with 5000 trace samples.
   hyperthreaded environment, but its fine if they are.
 - [x] Experiment with SIMD for pearson correlation calculation.
 
-  SIMD overhead is shadowing its benefits in small arrays of size ~50.
+  SIMD performance gains are small due to the size of involved arrays being
+  small. Currently it gives about x2.5 improvement.
 - [x] Experiment to get better cache locality.
 
   Current implementation has ~2.13% L1-d cache misses, it is possible to get it
