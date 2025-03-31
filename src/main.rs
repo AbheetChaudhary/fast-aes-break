@@ -1,4 +1,4 @@
-use ndarray::{Dim, ArrayBase, OwnedRepr, Axis, ArrayView1};
+use ndarray::{Dim, Axis};
 use std::time;
 use std::thread;
 mod correlation;
@@ -7,26 +7,29 @@ mod correlation;
 /// discard rest.
 const SURROUND: usize = 1500;
 
-/// Number of threads. DO NOT CHANGE it.
-const THREADS: usize = 8;
+/// Number of threads.
+const THREADS: usize = 4;
 
 /// HDF5 file path relative to crate root.
-const FILEPATH: &'static str = "./foobarbaz.h5";
+const FILEPATH: &'static str = "./trace_default.h5";
 
 /// Size of message in bytes.
 const MESSAGE_SIZE: usize = 16;
 
-/// Size of key in bytes. DO NOT CHANGE it.
+/// Size of key in bytes.
 const KEY_SIZE: usize = 16;
+
+/// Original key, this will be later used to verify whether we retrieved the
+/// correct key.
+const KEY_ORIGINAL: [u8; KEY_SIZE] = [
+    232, 147, 64, 211, 72, 230, 119, 247, 36, 79, 9, 164, 1, 157, 161, 145
+];
 
 /// Number of traces available.
 const TRACE_COUNT: usize = 50;
 
 /// Number of samples in each trace.
-const TRACE_SAMPLES: usize = 5250;
-
-/// Correct number of samples in each trace after the noise is removed.
-const CORRECT_SAMPLES: usize = 5000;
+const TRACE_SAMPLES: usize = 5000;
 
 /// AES SBOX array.
 const SBOX: [u8; 256] = [
@@ -60,39 +63,10 @@ fn main() -> hdf5::Result<()> {
     let textin_array = textin_array_dataset.read::<u8, Dim<[usize; 2]>>().unwrap();
     assert_eq!(textin_array.shape(), [TRACE_COUNT, MESSAGE_SIZE]);
 
-    let key_array_dataset = file.dataset("key_array")?;
-    let key_array = key_array_dataset.read::<u8, Dim<[usize; 2]>>().unwrap();
-    assert_eq!(key_array.shape(), [TRACE_COUNT, KEY_SIZE]);
-
-    // Extract the original key. Assuming each row in key_array is same.
-    let key_original = key_array.index_axis(Axis(0), 0).iter()
-        .map(|x| *x)
-        .collect::<Vec<u8>>();
-    println!("original: {key_original:?}");
-
-    // Filter the traces.
-    // Create empty array of the same size as the corrected trace_array 2D
-    // array. Filter the trace_array and fill the elements in this array one
-    // trace at a time.
-    let mut trace_array_filtered: ndarray::ArrayBase<OwnedRepr<f64>, Dim<[usize; 2]>> =
-        ArrayBase::zeros([TRACE_COUNT, CORRECT_SAMPLES]);
-    for (row, trace) in trace_array.axis_iter(Axis(0)).enumerate() {
-        assert_eq!(trace.shape(), [TRACE_SAMPLES]);
-        let real_begin = real_index(trace);
-        assert_eq!(trace.iter().skip(real_begin).take(CORRECT_SAMPLES).count(), 
-            CORRECT_SAMPLES, "Number of samples after real begin is less than {}", 
-            CORRECT_SAMPLES);
-        for (col, v) in trace.iter().skip(real_begin).take(CORRECT_SAMPLES).enumerate() {
-            *trace_array_filtered.get_mut([row, col]).unwrap() = *v;
-        }
-    }
-
-    let trace_array = trace_array_filtered;
-
     // A column of the trace_array 2D matrix. A row is entire trace, a column is 
     // vector of i'th value of each trace.
-    let mut trace_columns: Vec<Vec<f64>> = Vec::with_capacity(CORRECT_SAMPLES);
-    for col in 0..CORRECT_SAMPLES {
+    let mut trace_columns: Vec<Vec<f64>> = Vec::with_capacity(TRACE_SAMPLES);
+    for col in 0..TRACE_SAMPLES {
         let mut inner = Vec::with_capacity(TRACE_COUNT); // a column
         inner.extend(trace_array.index_axis(Axis(1), col).iter());
         assert_eq!(inner.len(), TRACE_COUNT);
@@ -123,8 +97,11 @@ fn main() -> hdf5::Result<()> {
                 power_model(SBOX[idx as usize]) as f64
             }).collect::<Vec<f64>>();
 
+            let power_sum = powers.iter().sum();
+            let power_sq_sum = powers.iter().map(|i| i * i).sum();
+
             for (i, trace) in trace_columns.iter().enumerate() {
-                let coeff = correlation::pearson_simd(&powers, trace).abs();
+                let coeff = correlation::pearson_simd(trace, &powers, power_sum, power_sq_sum).abs();
                 if coeff > max_coeff {
                     max_coeff = coeff;
                     col_idx = i;
@@ -136,8 +113,8 @@ fn main() -> hdf5::Result<()> {
     // println!("center: {}", center);
 
     let first_trace = center.saturating_sub(SURROUND / 2);
-    let last_trace = if center + SURROUND / 2 > CORRECT_SAMPLES - 1 {
-        CORRECT_SAMPLES - 1
+    let last_trace = if center + SURROUND / 2 > TRACE_SAMPLES - 1 {
+        TRACE_SAMPLES - 1
     } else {
         center + SURROUND / 2
     };
@@ -161,8 +138,11 @@ fn main() -> hdf5::Result<()> {
                 power_model(SBOX[idx as usize]) as f64
             }).collect::<Vec<f64>>();
 
+            let power_sum = powers.iter().sum();
+            let power_sq_sum = powers.iter().map(|i| i * i).sum();
+
             for trace in useful_traces {
-                let coeff = correlation::pearson_simd(&powers, trace).abs();
+                let coeff = correlation::pearson_simd(trace, &powers, power_sum, power_sq_sum).abs();
                 if coeff > max_coeff {
                     max_coeff = coeff;
                     key_at_max = key_guess;
@@ -193,7 +173,7 @@ fn main() -> hdf5::Result<()> {
                     let xorred = &input_columns[idx_key][i] ^ key_guess;
                     *p = power_model(SBOX[xorred as usize]) as f64;
                 }
-                let coeff = correlation::pearson_simd(&powers, trace).abs();
+                let coeff = correlation::pearson(&powers, trace).abs();
                 if coeff > max_coeff {
                     max_coeff = coeff;
                     key_at_max = key_guess;
@@ -206,7 +186,8 @@ fn main() -> hdf5::Result<()> {
 
 
     // Number of chunks in which processing will be done. Each chunk will
-    // be processed by THREADS number of threads at a time.
+    // be processed by THREADS number of threads at a time. Each thread will
+    // find a byte of the key.
     const CHUNKS: usize = if KEY_SIZE % THREADS == 0 {
         KEY_SIZE / THREADS
     } else {
@@ -218,14 +199,12 @@ fn main() -> hdf5::Result<()> {
         thread::scope(|s| {
             let mut handles = Vec::with_capacity(THREADS);
 
-            handles.push(s.spawn(|| key_solver(i)));
-            handles.push(s.spawn(|| key_solver(i + 1)));
-            handles.push(s.spawn(|| key_solver(i + 2)));
-            handles.push(s.spawn(|| key_solver(i + 3)));
-            handles.push(s.spawn(|| key_solver(i + 4)));
-            handles.push(s.spawn(|| key_solver(i + 5)));
-            handles.push(s.spawn(|| key_solver(i + 6)));
-            handles.push(s.spawn(|| key_solver(i + 7)));
+            for j in 0..THREADS {
+                // solve for key byte at index "i + j"
+                if i + j < KEY_SIZE {
+                    handles.push(s.spawn(move || key_solver(i + j)));
+                }
+            }
 
             key.extend(handles.into_iter().map(|h| h.join().unwrap()));
         });
@@ -235,11 +214,11 @@ fn main() -> hdf5::Result<()> {
  
     println!("recovered: {:?}", key);
 
-    assert!(key_original.eq(&key), "Recovered and original keys did not matched. Try \
+    assert!(KEY_ORIGINAL.iter().eq(key.iter()), "Recovered and original keys did not matched. Try \
         increasing the surrounding value. Currently SURROUND = {SURROUND}");
 
     println!("recovered and original keys matched.");
-    println!("time: {elapsed:.03?}");
+    println!("main loop time: {elapsed:.03?}");
 
     Ok(())
 }
@@ -269,34 +248,4 @@ const HAMMING_WEIGHTS: [usize; 256] = [
 /// power is required to process that byte.
 fn power_model(sboxed: u8) -> usize {
     HAMMING_WEIGHTS[sboxed as usize]
-}
-
-/// Size of the noise implanted between indices 0-250
-const THRESHOLD: usize = 50;
-
-/// Find the real index from which the samples begin. Real index is where an
-/// array of ~THRESHOLD equal elements ends.
-fn real_index(view: ArrayView1<f64>) -> usize {
-    let mut real: Option<usize> = None;
-    let mut confidence = 1;
-    let mut previous: Option<f64> = None;
-    for (i, x) in view.iter().take(250).enumerate() {
-        match previous.take() {
-            Some(p) if *x == p => {
-                confidence += 1;
-                if confidence == THRESHOLD {
-                    real = Some(i);
-                    break;
-                }
-            }
-            Some(_) => {
-                confidence = 1;
-            }
-            None => {}
-        }
-
-        previous = Some(*x);
-    }
-
-    real.expect("there was supposed to be some real index")
 }
